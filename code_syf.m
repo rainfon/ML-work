@@ -150,8 +150,6 @@ function cfg = makeMLActiveComparisonConfig()
     cfg.randomObjectiveEJitter = 0;
     cfg.caiPositiveTol = 1e-12;
     cfg.msPositiveTol = cfg.caiPositiveTol;
-    cfg.regretEps = 1e-6;
-
     % 为保证三种主动学习策略预算可比，TWD-AL 在 NEG 不足 K 时从剩余样本中按低支持度补足。
     % 若希望严格按照三支决策只询问 NEG，可设为 false。
     cfg.twdFillToBudget = true;
@@ -168,13 +166,6 @@ function cfg = makeMLActiveComparisonConfig()
     cfg.linprogVerboseFallback = false;
     cfg.saveLinprogFailure = false;
     cfg.linprogFailureDir = pwd;
-
-    % 兼容旧函数的参数
-    cfg.bcmTrajectories = 50;
-    cfg.minPseudoLabelWeight = 1e-8;
-    cfg.useParallel = false;
-    cfg.parallelNumWorkers = [];
-    cfg.numWorkers = [];
 
     % 是否保存结果
     cfg.saveResults = true;
@@ -370,198 +361,15 @@ function Summary = summarizeByMethods(RawResults, methodOrder)
         end
     end
     Summary = struct2table(rows);
-end
-
-function evalResult = runRandomTestPoolNoPOSExperiment(Xtrain0, ytrain0, Xtest, ytest, q, cfg)
-%RUNRANDOMTESTPOOLNOPOSExperiment Random-query baseline.
-% BAL-Rand uses Lex-PL, does not construct POS pseudo labels, does not compute
-% TWD regions, and does not restrict query candidates to NEG. It uniformly
-% samples K alternatives from the whole test pool, then uses only their true
-% feedback to update the final model.
-
-    tStart = tic;
-    initialModel = trainLexPLWeighted(Xtrain0, ytrain0, ones(numel(ytrain0), 1), q, cfg);
-    initialPrediction = predictLexPL(initialModel, Xtest, cfg);
-
-    nTest = numel(ytest);
-    if nTest == 0 || cfg.K <= 0
-        selected = zeros(0, 1);
-        stopReason = "NoTestCandidate_BALRand";
-    else
-        batchSize = min(cfg.K, nTest);
-        selected = randperm(nTest, batchSize)';
-        if batchSize < cfg.K
-            stopReason = "TestLessThanBatch_BALRand";
-        else
-            stopReason = "BatchCompleted_BALRand";
-        end
-    end
-
-    if isempty(selected)
-        corrections = 0;
-    else
-        corrections = sum(initialPrediction(selected) ~= ytest(selected));
-    end
-
-    XFinalLearning = [Xtrain0; Xtest(selected, :)];
-    yFinalLearning = [ytrain0; ytest(selected)];
-    wFinalLearning = ones(numel(yFinalLearning), 1);
-
-    finalModel = trainLexPLWeighted(XFinalLearning, yFinalLearning, wFinalLearning, q, cfg);
-    finalPred = predictLexPL(finalModel, Xtest, cfg);
-
-    if ~isempty(selected)
-        finalPred(selected) = ytest(selected);
-    end
-
-    metrics = calculateOrderedMetrics(ytest, finalPred, q);
-    evalResult = makeEvalResult(metrics, numel(selected), corrections, toc(tStart), stopReason);
-end
-
-function evalResult = runTWDBCMMMRExperiment(Xtrain0, ytrain0, Xtest, ytest, q, cfg)
-%RUNTWDBCMMMRExperiment Proposed TWD-BAL.
-% Current logic:
-%   1) Train initial MM-UTADIS.
-%   2) Compute compatible-model MS, pS, and TWD regions.
-%   3) Query only NEG alternatives.
-%   4) Within NEG, select a batch by BCM trajectory simulation matching with MMR.
-%   5) After true query feedback, retrain the central model.
-%   6) Re-sample compatible models using the updated reference set, recompute TWD over
-%      the whole candidate pool, and generate updated POS weighted pseudo-labels.
-
-    tStart = tic;
-    nTest = numel(ytest);
-    k = min(cfg.K, nTest);
-
-    if nTest == 0 || k <= 0
-        metrics = calculateOrderedMetrics(ytest, nan(size(ytest)), q);
-        evalResult = makeEvalResult(metrics, 0, 0, toc(tStart), "EmptyTestPool_TWD_BAL");
-        return;
-    end
-
-    initialModel = trainMMUTADIS(Xtrain0, ytrain0, q, cfg);
-    initialRisk = computeTWDInfo(initialModel, Xtrain0, ytrain0, Xtest, cfg);
-
-    negIdx = find(initialRisk.Region == 3);
-
-    if isempty(negIdx)
-        selected = zeros(0, 1);
-        stopReason = "NoNEG_TWD_BAL";
-    else
-        kNeg = min(k, numel(negIdx));
-        [selectedLocal, stopReason] = selectBatchByBCMMMR( ...
-            initialModel, Xtrain0, ytrain0, Xtest(negIdx, :), cfg, kNeg);
-
-        selectedLocal = unique(selectedLocal(:), 'stable');
-        selectedLocal = selectedLocal(selectedLocal >= 1 & selectedLocal <= numel(negIdx));
-        selectedLocal = selectedLocal(1:min(numel(selectedLocal), kNeg));
-        selected = negIdx(selectedLocal);
-
-        if numel(selected) < k
-            stopReason = stopReason + "_NEGLessThanK";
-        else
-            stopReason = stopReason + "_NEGOnly";
-        end
-    end
-
-    if isempty(selected)
-        corrections = 0;
-    else
-        corrections = sum(initialRisk.pred(selected) ~= ytest(selected));
-    end
-
-    finalPred = predictWithUpdatedPOSWeightedPseudoLabels( ...
-        Xtrain0, ytrain0, Xtest, ytest, q, cfg, selected);
-
-    metrics = calculateOrderedMetrics(ytest, finalPred, q);
-    evalResult = makeEvalResult(metrics, numel(selected), corrections, toc(tStart), stopReason);
-end
-
-function finalPred = predictWithUpdatedPOSWeightedPseudoLabels( ...
-    Xtrain0, ytrain0, Xtest, ytest, q, cfg, selected)
-%PREDICTWITHUPDATEDPOSWEIGHTEDPSEUDOLABELS Final prediction with updated POS pseudo-labels.
-% This function is aligned with the current ablation code:
-% queried true labels are first added, the compatible-model space is recomputed
-% on the updated reference set, and POS pseudo-labels are generated only from
-% unqueried alternatives after full-pool TWD recomputation.
-
-    nTest = numel(ytest);
-    selected = unique(selected(:), 'stable');
-    selected = selected(selected >= 1 & selected <= nTest);
-
-    XSupervised = Xtrain0;
-    ySupervised = ytrain0;
-    wSupervised = ones(numel(ytrain0), 1);
-
-    if ~isempty(selected)
-        XSupervised = [XSupervised; Xtest(selected, :)];
-        ySupervised = [ySupervised; ytest(selected)];
-        wSupervised = [wSupervised; ones(numel(selected), 1)];
-    end
-
-    feedbackModel = trainMMUTADIS(XSupervised, ySupervised, q, cfg);
-    finalPred = predictMMUTADIS(feedbackModel, Xtest);
-
-    unqueriedMask = true(nTest, 1);
-    unqueriedMask(selected) = false;
-    if ~any(unqueriedMask)
-        if ~isempty(selected)
-            finalPred(selected) = ytest(selected);
-        end
-        return;
-    end
-
-    updatedRiskAll = computeTWDInfo(feedbackModel, XSupervised, ySupervised, Xtest, cfg);
-    if isempty(updatedRiskAll.MS)
-        if ~isempty(selected)
-            finalPred(selected) = ytest(selected);
-        end
-        return;
-    end
-
-    [consensusWeightAll, consensusLabelAll] = max(updatedRiskAll.MS, [], 2);
-    consensusLabelAll = consensusLabelAll(:);
-    consensusWeightAll = consensusWeightAll(:);
-    centralLabelAll = updatedRiskAll.pred(:);
-
-    keepAll = unqueriedMask & ...
-              updatedRiskAll.Region(:) == 1 & ...
-              centralLabelAll == consensusLabelAll & ...
-              isfinite(consensusWeightAll) & ...
-              consensusWeightAll >= updatedRiskAll.alpha;
-
-    posIdx = find(keepAll);
-    posPseudoLabel = consensusLabelAll(keepAll);
-    posPseudoWeight = consensusWeightAll(keepAll);
-
-    posPseudoWeight = max(0, min(1, posPseudoWeight));
-    posPseudoWeight = max(posPseudoWeight, getMinPseudoLabelWeight(cfg));
-
-    if ~isempty(posIdx)
-        XFinal = [XSupervised; Xtest(posIdx, :)];
-        yFinal = [ySupervised; posPseudoLabel];
-        wFinal = [wSupervised; posPseudoWeight];
-
-        finalModel = trainWeightedMMUTADIS(XFinal, yFinal, wFinal, q, cfg);
-        finalPred = predictMMUTADIS(finalModel, Xtest);
-
-        % POS means accepted recommendation; keep accepted pseudo-labels fixed.
-        finalPred(posIdx) = posPseudoLabel;
-    end
-
-    if ~isempty(selected)
-        finalPred(selected) = ytest(selected);
-    end
-end
 
 %% ============================================================
-%% TWD-BAL robust information, compatible-model sampling, BCM-MMR
+%% TWD risk information and compatible-model sampling
 %% ============================================================
 
 function risk = computeTWDInfo(model, Xref, yref, Xpool, cfg)
     if isempty(Xpool)
         risk = struct('pred', [], 'Ucentral', [], 'MS', [], 'samples', [], ...
-            'pS', [], 'mMR', [], 'alpha', [], 'beta', [], 'Region', []);
+            'pS', [], 'alpha', [], 'beta', [], 'Region', []);
         return;
     end
 
@@ -588,14 +396,10 @@ function rob = computeRobustInfo(model, Xref, yref, Xpool, cfg)
     [pred, Ucentral] = predictMMUTADIS(model, Xpool);
     samples = sampleCompatibleAdditiveModels(Xref, yref, Xpool, q, model.phiStar, cfg);
 
-    MS = samples.MS;
-    mMR = computeApproxMMR(samples, q, cfg);
-
     rob.pred = pred;
     rob.Ucentral = Ucentral;
-    rob.MS = MS;
+    rob.MS = samples.MS;
     rob.samples = samples;
-    rob.mMR = mMR;
 end
 
 function samples = sampleCompatibleAdditiveModels(Xref, yref, Xpool, q, phiStar, cfg)
@@ -710,239 +514,6 @@ function sampleMatrix = sampleStage1CompatibleModelsRandomObjectiveMix(Acomp, rh
     end
 end
 
-function mMR = computeApproxMMR(samples, q, cfg)
-    U = samples.USamples;
-    b = samples.bSamples;
-    nPool = size(U, 1);
-    S = size(U, 2);
-
-    B = [zeros(1, S); b; ones(1, S)];
-    MR = zeros(nPool, q);
-
-    for h = 1:q
-        lower = repmat(B(h, :), nPool, 1);
-        upper = repmat(B(h + 1, :), nPool, 1);
-        R1 = lower - U;
-        R2 = U - upper + cfg.regretEps;
-        R = max(max(R1, R2), 0);
-        MR(:, h) = max(R, [], 2);
-    end
-
-    mMR = min(MR, [], 2);
-end
-
-function [selected, stopReason] = selectBatchByBCMMMR(model0, Xtrain0, ytrain0, XpoolNeg, cfg, k)
-    nPool = size(XpoolNeg, 1);
-    if nPool == 0 || k <= 0
-        selected = zeros(0, 1);
-        stopReason = "EmptyPool_BCM_MMR";
-        return;
-    end
-
-    numTraj = getBCMTrajectoryCount(cfg);
-    [trajectories, initialScore] = simulateBCMTrajectoriesByMMR( ...
-        model0, Xtrain0, ytrain0, XpoolNeg, cfg, k, numTraj);
-
-    candidateUniverse = unique(vertcatCell(trajectories), 'stable');
-    candidateUniverse = candidateUniverse(candidateUniverse >= 1 & candidateUniverse <= nPool);
-
-    if numel(candidateUniverse) < min(k, nPool)
-        filler = chooseTopKByScore(initialScore, (1:nPool)', min(k, nPool));
-        candidateUniverse = unique([candidateUniverse(:); filler(:)], 'stable');
-    end
-
-    if isempty(candidateUniverse)
-        selected = zeros(0, 1);
-        stopReason = "NoCandidate_BCM_MMR";
-        return;
-    end
-
-    selected = selectBCMByDeletionGreedyMatch(candidateUniverse, trajectories, XpoolNeg, cfg, k, initialScore);
-
-    if isempty(selected)
-        stopReason = "NoCandidate_BCM_MMR";
-    else
-        stopReason = "BatchCompleted_BCM_MMR";
-    end
-end
-
-function [trajectories, initialScore] = simulateBCMTrajectoriesByMMR(model0, Xtrain0, ytrain0, Xpool, cfg, k, numTraj)
-    nPool = size(Xpool, 1);
-    trajectories = cell(numTraj, 1);
-
-    [initialScore, ~, initialMS] = computeBCMMMRStepScore(model0, Xtrain0, ytrain0, Xpool, cfg); %#ok<ASGLU>
-    if isempty(initialScore)
-        initialScore = -inf(nPool, 1);
-    end
-
-    for trajectoryId = 1:numTraj
-        currentX = Xtrain0;
-        currentY = ytrain0;
-        currentPoolIdx = (1:nPool)';
-        trajectory = zeros(k, 1);
-        stepCount = 0;
-
-        for step = 1:k
-            if isempty(currentPoolIdx)
-                break;
-            end
-
-            Xcand = Xpool(currentPoolIdx, :);
-
-            try
-                if step == 1
-                    currentModel = model0;
-                else
-                    currentModel = trainMMUTADIS(currentX, currentY, model0.q, cfg);
-                end
-                [score, pred, MS] = computeBCMMMRStepScore(currentModel, currentX, currentY, Xcand, cfg);
-            catch
-                score = rand(numel(currentPoolIdx), 1);
-                pred = ones(numel(currentPoolIdx), 1);
-                MS = [];
-            end
-
-            candidates = (1:numel(currentPoolIdx))';
-            chosenLocal = chooseOneByScore(score, candidates);
-            if isempty(chosenLocal)
-                break;
-            end
-
-            chosenPoolIdx = currentPoolIdx(chosenLocal);
-            stepCount = stepCount + 1;
-            trajectory(stepCount) = chosenPoolIdx;
-
-            if ~isempty(MS) && chosenLocal <= size(MS, 1)
-                hypLabel = sampleLabelFromPosterior(MS(chosenLocal, :));
-            else
-                hypLabel = pred(chosenLocal);
-            end
-
-            currentX = [currentX; Xpool(chosenPoolIdx, :)]; %#ok<AGROW>
-            currentY = [currentY; hypLabel]; %#ok<AGROW>
-            currentPoolIdx(chosenLocal) = [];
-        end
-
-        trajectories{trajectoryId} = trajectory(1:stepCount);
-    end
-end
-
-function [score, pred, MS] = computeBCMMMRStepScore(model, Xtrain, ytrain, Xcand, cfg)
-    rob = computeRobustInfo(model, Xtrain, ytrain, Xcand, cfg);
-    pred = rob.pred(:);
-    MS = rob.MS;
-    score = rob.mMR(:);
-    score(~isfinite(score)) = -inf;
-end
-
-function selected = selectBCMByDeletionGreedyMatch(candidateUniverse, trajectories, Xpool, cfg, k, scoreForTieBreak)
-    candidateUniverse = unique(candidateUniverse(:), 'stable');
-    candidateUniverse = candidateUniverse(candidateUniverse >= 1 & candidateUniverse <= size(Xpool, 1));
-    batchSize = min(k, numel(candidateUniverse));
-    if batchSize <= 0
-        selected = zeros(0, 1);
-        return;
-    end
-
-    mu = candidateUniverse(:);
-    PhiAll = computePiecewiseLinearBasis(Xpool, cfg.L);
-
-    while numel(mu) > batchSize
-        bestCost = inf;
-        bestRemovePos = 1;
-
-        for removePos = 1:numel(mu)
-            muMinus = mu([1:removePos-1, removePos+1:end]);
-            cost = bcmGreedyMatchingCost(muMinus, trajectories, PhiAll);
-
-            removeIdx = mu(removePos);
-            bestRemoveIdx = mu(bestRemovePos);
-            removeScore = safeScore(scoreForTieBreak, removeIdx);
-            bestRemoveScore = safeScore(scoreForTieBreak, bestRemoveIdx);
-
-            if cost < bestCost - 1e-12 || ...
-                    (abs(cost - bestCost) <= 1e-12 && removeScore < bestRemoveScore)
-                bestCost = cost;
-                bestRemovePos = removePos;
-            end
-        end
-
-        mu(bestRemovePos) = [];
-    end
-
-    finalScore = arrayfun(@(idx) safeScore(scoreForTieBreak, idx), mu);
-    [~, ord] = sortrows([-finalScore(:), mu(:)]);
-    selected = mu(ord);
-end
-
-function cost = bcmGreedyMatchingCost(mu, trajectories, PhiAll)
-    if isempty(mu)
-        cost = inf;
-        return;
-    end
-
-    PhiMu = PhiAll(mu, :);
-    totalCost = 0;
-
-    for trajectoryId = 1:numel(trajectories)
-        trajectory = trajectories{trajectoryId};
-        trajectory = trajectory(:);
-        trajectory = trajectory(trajectory >= 1 & trajectory <= size(PhiAll, 1));
-        if isempty(trajectory)
-            continue;
-        end
-
-        PhiTrajectory = PhiAll(trajectory, :);
-        D = zeros(numel(mu), numel(trajectory));
-        for i = 1:numel(mu)
-            diffMat = PhiTrajectory - PhiMu(i, :);
-            D(i, :) = sum(diffMat .^ 2, 2)';
-        end
-        totalCost = totalCost + greedyAssignmentCost(D);
-    end
-
-    cost = totalCost;
-end
-
-function matchCost = greedyAssignmentCost(distanceMatrix)
-    [numMu, numTrajectory] = size(distanceMatrix);
-    usedMu = false(numMu, 1);
-    usedTrajectory = false(numTrajectory, 1);
-    matchCost = 0;
-    numMatch = min(numMu, numTrajectory);
-
-    for matchId = 1:numMatch %#ok<NASGU>
-        D = distanceMatrix;
-        D(usedMu, :) = inf;
-        D(:, usedTrajectory) = inf;
-        [minValue, linearIndex] = min(D(:));
-        if isinf(minValue)
-            break;
-        end
-        [rowIndex, colIndex] = ind2sub(size(distanceMatrix), linearIndex);
-        matchCost = matchCost + minValue;
-        usedMu(rowIndex) = true;
-        usedTrajectory(colIndex) = true;
-    end
-end
-
-function chosen = chooseOneByScore(score, candidates)
-    candidates = candidates(:);
-    if isempty(candidates)
-        chosen = [];
-        return;
-    end
-    sub = score(candidates);
-    sub(~isfinite(sub)) = -inf;
-    if ~any(isfinite(sub))
-        chosen = candidates(1);
-        return;
-    end
-    jitter = 1e-10 * rand(numel(candidates), 1);
-    [~, ord] = sortrows([-(sub(:) + jitter(:)), candidates(:)]);
-    chosen = candidates(ord(1));
-end
-
 function selected = chooseTopKByScore(score, candidates, k)
     candidates = candidates(:);
     if isempty(candidates) || k <= 0
@@ -962,78 +533,9 @@ function selected = chooseTopKByScore(score, candidates, k)
     selected = candidates(1:min(k, numel(candidates)));
 end
 
-function label = sampleLabelFromPosterior(probRow)
-    probRow = double(probRow(:));
-    probRow(~isfinite(probRow) | probRow < 0) = 0;
-    if isempty(probRow) || sum(probRow) <= 0
-        label = 1;
-        return;
-    end
-    probRow = probRow ./ sum(probRow);
-    edges = cumsum(probRow);
-    r = rand();
-    label = find(r <= edges, 1, 'first');
-    if isempty(label)
-        label = numel(probRow);
-    end
-end
-
-function v = vertcatCell(C)
-    v = zeros(0, 1);
-    for i = 1:numel(C)
-        if ~isempty(C{i})
-            v = [v; C{i}(:)]; %#ok<AGROW>
-        end
-    end
-end
-
-function val = safeScore(score, idx)
-    if isempty(score) || idx < 1 || idx > numel(score) || ~isfinite(score(idx))
-        val = -inf;
-    else
-        val = score(idx);
-    end
-end
-
-function nTraj = getBCMTrajectoryCount(cfg)
-    if isfield(cfg, 'bcmTrajectories') && ~isempty(cfg.bcmTrajectories) && isfinite(cfg.bcmTrajectories)
-        nTraj = max(1, round(cfg.bcmTrajectories));
-    else
-        nTraj = 20;
-    end
-end
-
-function wMin = getMinPseudoLabelWeight(cfg)
-    if isfield(cfg, 'minPseudoLabelWeight') && ~isempty(cfg.minPseudoLabelWeight) && isfinite(cfg.minPseudoLabelWeight)
-        wMin = max(0, cfg.minPseudoLabelWeight);
-    else
-        wMin = 1e-8;
-    end
-end
-
-%% ============================================================
-%% Additive UTADIS / Lex-PL / MM-UTADIS learners
-%% ============================================================
-
-function model = trainUTADISStage1(X, y, q, cfg)
-    [theta, b, phiStar] = solveUTADISStage1Weighted(X, y, ones(numel(y), 1), q, cfg);
-    model.type = "UTADIS-Stage1";
-    model.q = q;
-    model.L = cfg.L;
-    model.theta = theta;
-    model.b = b(:);
-    model.delta = NaN;
-    model.phiStar = phiStar;
-end
-
 function model = trainLexPLWeighted(X, y, sampleWeight, q, cfg)
     model = trainWeightedMMUTADIS(X, y, sampleWeight, q, cfg);
     model.type = "Lex-PL";
-end
-
-function model = trainMMUTADIS(X, y, q, cfg)
-    model = trainWeightedMMUTADIS(X, y, ones(numel(y), 1), q, cfg);
-    model.type = "MM-UTADIS";
 end
 
 function model = trainWeightedMMUTADIS(X, y, sampleWeight, q, cfg)
@@ -1276,124 +778,6 @@ function w = validateSampleWeights(w, n)
 end
 
 %% ============================================================
-%% Choquet-UTADIS baseline
-%% ============================================================
-
-function model = trainChoquetUTADIS(X, y, q, cfg)
-    n = size(X, 1);
-    m = size(X, 2);
-    [pairs, pairIndex] = buildPairs(m);
-    F = computeChoquetFeatures(X, pairs);
-    nMob = size(F, 2);
-    nB = q - 1;
-    idxMob = 1:nMob;
-    idxB = nMob + (1:nB);
-    idxE = nMob + nB + (1:n);
-    nVar = nMob + nB + n;
-
-    A = sparse(0, nVar);
-    rhs = [];
-
-    for i = 1:n
-        h = y(i);
-        if h > 1
-            row = zeros(1, nVar);
-            row(idxMob) = -F(i, :);
-            row(idxB(h - 1)) = 1;
-            row(idxE(i)) = -1;
-            A = [A; sparse(row)]; %#ok<AGROW>
-            rhs = [rhs; 0]; %#ok<AGROW>
-        end
-        if h < q
-            row = zeros(1, nVar);
-            row(idxMob) = F(i, :);
-            row(idxB(h)) = -1;
-            row(idxE(i)) = -1;
-            A = [A; sparse(row)]; %#ok<AGROW>
-            rhs = [rhs; 0]; %#ok<AGROW>
-        end
-    end
-
-    [A, rhs] = addThresholdOrderRows(A, rhs, idxB, q, cfg.thresholdMinGap, nVar);
-
-    % 2-additive monotonicity constraints
-    for i = 1:m
-        others = setdiff(1:m, i);
-        for mask = 0:(2^numel(others) - 1)
-            row = zeros(1, nVar);
-            row(i) = -1;
-            for s = 1:numel(others)
-                if bitget(mask, s)
-                    j = others(s);
-                    row(pairIndex(i, j)) = row(pairIndex(i, j)) - 1;
-                end
-            end
-            A = [A; sparse(row)]; %#ok<AGROW>
-            rhs = [rhs; 0]; %#ok<AGROW>
-        end
-    end
-
-    f = zeros(nVar, 1);
-    f(idxE) = 1;
-    Aeq = sparse(1, idxMob, ones(1, nMob), 1, nVar);
-    beq = 1;
-
-    lb = -inf(nVar, 1);
-    ub = inf(nVar, 1);
-    lb(1:m) = 0;
-    ub(1:m) = 1;
-    if nMob > m
-        lb(m+1:nMob) = -1;
-        ub(m+1:nMob) = 1;
-    end
-    lb(idxB) = 0;
-    ub(idxB) = 1;
-    lb(idxE) = 0;
-
-    [sol, fval] = runLinprog(f, A, rhs, Aeq, beq, lb, ub, cfg);
-
-    model.q = q;
-    model.mobius = sol(idxMob);
-    model.b = sol(idxB);
-    model.pairs = pairs;
-    model.pairIndex = pairIndex;
-    model.phiStar = fval;
-end
-
-function pred = predictChoquetUTADIS(model, X)
-    F = computeChoquetFeatures(X, model.pairs);
-    U = F * model.mobius;
-    pred = assignByThresholds(U, model.b, model.q);
-end
-
-function [pairs, pairIndex] = buildPairs(m)
-    pairs = [];
-    pairIndex = zeros(m, m);
-    idx = m;
-    for i = 1:m - 1
-        for j = i + 1:m
-            idx = idx + 1;
-            pairs = [pairs; i j]; %#ok<AGROW>
-            pairIndex(i, j) = idx;
-            pairIndex(j, i) = idx;
-        end
-    end
-end
-
-function F = computeChoquetFeatures(X, pairs)
-    n = size(X, 1);
-    m = size(X, 2);
-    np = size(pairs, 1);
-    F = zeros(n, m + np);
-    F(:, 1:m) = X;
-    for pairId = 1:np
-        i = pairs(pairId, 1);
-        j = pairs(pairId, 2);
-        F(:, m + pairId) = min(X(:, i), X(:, j));
-    end
-end
-
-%% ============================================================
 %% Data loading, splitting, metrics, summary
 %% ============================================================
 
@@ -1568,39 +952,6 @@ function rows = emptyResultRows()
         'Corrections', {}, 'CorrectionRate', {}, 'Time', {}, 'StopReason', {});
 end
 
-function Summary = summarizeMainComparisonTable(RawResults)
-    datasets = unique(RawResults.Dataset, 'stable');
-    methodOrder = ["UTADIS", "Choquet-UTADIS", "Lex-PL", "BAL-Rand", "TWD-BAL"];
-
-    rows = struct('Dataset', {}, 'Method', {}, 'Accuracy', {}, 'Precision', {}, ...
-                  'Recall', {}, 'Fmeasure', {}, 'MAE', {}, 'CR', {}, 'Queries', {}, 'Time', {});
-
-    for d = 1:numel(datasets)
-        for methodId = 1:numel(methodOrder)
-            idx = RawResults.Dataset == datasets(d) & RawResults.Method == methodOrder(methodId);
-            if ~any(idx)
-                continue;
-            end
-            r.Dataset = datasets(d);
-            r.Method = methodOrder(methodId);
-            r.Accuracy  = pm(RawResults.Accuracy(idx), 4);
-            r.Precision = pm(RawResults.Precision(idx), 4);
-            r.Recall    = pm(RawResults.Recall(idx), 4);
-            r.Fmeasure  = pm(RawResults.Fmeasure(idx), 4);
-            r.MAE       = pm(RawResults.MAE(idx), 4);
-            r.Queries   = pm(RawResults.Queries(idx), 2);
-            r.Time      = pm(RawResults.Time(idx), 2);
-            if all(RawResults.Queries(idx) == 0)
-                r.CR = "-";
-            else
-                r.CR = pm(RawResults.CorrectionRate(idx), 4);
-            end
-            rows(end+1) = r; %#ok<AGROW>
-        end
-    end
-    Summary = struct2table(rows);
-end
-
 function s = pm(x, digits)
     x = x(~isnan(x));
     if isempty(x)
@@ -1614,7 +965,7 @@ function s = pm(x, digits)
 end
 
 %% ============================================================
-%% Configuration, path, parallel, and solver helpers
+%% Configuration, path, and solver helpers
 %% ============================================================
 
 function filePath = resolveDataFilePath(dataDir, fileName)
@@ -1657,9 +1008,6 @@ function validateComparisonConfig(cfg)
     if cfg.objectiveSlack < 0
         error('cfg.objectiveSlack must be nonnegative.');
     end
-    if cfg.bcmTrajectories < 1 || fix(cfg.bcmTrajectories) ~= cfg.bcmTrajectories
-        error('cfg.bcmTrajectories must be a positive integer.');
-    end
     if cfg.randomObjectivePoolSize < 1 || fix(cfg.randomObjectivePoolSize) ~= cfg.randomObjectivePoolSize
         error('cfg.randomObjectivePoolSize must be a positive integer.');
     end
@@ -1680,31 +1028,6 @@ function validateDatasetForComparison(X, y, q, fileName)
     end
     if any(y < 1) || any(y > q) || any(fix(y) ~= y)
         error('Dataset %s contains invalid ordered class labels.', fileName);
-    end
-end
-
-function ok = ensureParallelPool(cfg)
-    ok = false;
-    try
-        if isempty(ver('parallel'))
-            warning('Parallel Computing Toolbox is not available. Falling back to serial processing.');
-            return;
-        end
-        pool = gcp('nocreate');
-        if isempty(pool)
-            if isempty(cfg.numWorkers)
-                parpool('local');
-            else
-                parpool('local', cfg.numWorkers);
-            end
-        elseif ~isempty(cfg.numWorkers) && pool.NumWorkers < cfg.numWorkers
-            warning('当前并行池 worker 数为 %d，小于 cfg.numWorkers=%d。若需要更多 worker，请先 delete(gcp(''nocreate'')) 后重新运行。', ...
-                pool.NumWorkers, cfg.numWorkers);
-        end
-        ok = true;
-    catch ME
-        warning('Unable to start a parallel pool: %s. Falling back to serial processing.', ME.message);
-        ok = false;
     end
 end
 
@@ -1813,22 +1136,3 @@ function ok = isFeasiblePoint(x, A, rhs, Aeq, beq, lb, ub, tol)
     end
 
     eqViolation = max(abs(Aeq * x - beq));
-    if isempty(eqViolation)
-        eqViolation = 0;
-    end
-
-    lbViolation = max(lb - x);
-    if isempty(lbViolation)
-        lbViolation = -inf;
-    end
-
-    finiteUb = isfinite(ub);
-    if any(finiteUb)
-        ubViolation = max(x(finiteUb) - ub(finiteUb));
-    else
-        ubViolation = -inf;
-    end
-
-    ok = ineqViolation <= tol && eqViolation <= tol && ...
-         lbViolation <= tol && ubViolation <= tol;
-end
